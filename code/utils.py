@@ -15,27 +15,39 @@ from matplotlib.patches import Circle, Rectangle
 import umap
 from sklearn.decomposition import PCA
 
+plt.style.use('ggplot')
 plt.switch_backend('agg')
 
 
-def visualize_image(image_info, bbox=False, uv=False):
+def visualize_image(image_info, save_dir, bbox=False, adjusttext=False):
     '''
     :param image_info: (dict)
     '''
-
     uv_to_xy = lambda uv: (uv[1], uv[0])
 
-    root = Path(os.getcwd()).parent
-    sys.path.append(root)
+    mpii_skelton = [['head', 'neck', (0, 0, 1)], ['neck', 'thorax', (0, 0, 1)],
+                    ['thorax', 'lsho', (0, 1, 0)], ['lsho', 'lelb', (0, 1, 1)], ['lelb', 'lwri', (0, 1, 1)],
+                    ['thorax', 'rsho', (0, 1, 0)], ['rsho', 'relb', (1, 0, 0)], ['relb', 'rwri', (1, 0, 0)],
+                    ['lsho', 'lhip', (0, 1, 0)], ['rsho', 'rhip', (0, 1, 0)],
+                    ['pelvis', 'lhip', (0, 1, 0)], ['lhip', 'lknee', (1, 0, 1)], ['lknee', 'lankl', (1, 0, 1)],
+                    ['pelvis', 'rhip', (0, 1, 0)], ['rhip', 'rknee', (1, 1, 0)], ['rknee', 'rankl', (1, 1, 0)]]
 
-    colour = {'rankl': (0, 0, 1), 'rknee': (0, 0, 1), 'rhip': (0, 0, 1),
-              'lankl': (1, 0, 0), 'lknee': (1, 0, 0), 'lhip': (1, 0, 0),
-              'rwri': (1, 1, 0), 'relb': (1, 1, 0), 'rsho': (1, 1, 0),
-              'lwri': (0, 1, 0), 'lelb': (0, 1, 0), 'lsho': (0, 1, 0),
-              'head': (0, 1, 1), 'neck': (0, 1, 1)}
+    lsp_skeleton = [['head', 'neck', (0, 0, 1)], ['lhip', 'rhip', (0, 1, 0)],
+                    ['neck', 'lsho', (0, 1, 0)], ['lsho', 'lelb', (0, 1, 1)], ['lelb', 'lwri', (0, 1, 1)],
+                    ['neck', 'rsho', (0, 1, 0)], ['rsho', 'relb', (1, 0, 0)], ['relb', 'rwri', (1, 0, 0)],
+                    ['lsho', 'lhip', (0, 1, 0)], ['lhip', 'lknee', (1, 0, 1)], ['lknee', 'lankl', (1, 0, 1)],
+                    ['rsho', 'rhip', (0, 1, 0)], ['rhip', 'rknee', (1, 1, 0)], ['rknee', 'rankl', (1, 1, 0)]]
 
-    os.makedirs(os.path.join(root, 'results', 'viz_gt'), exist_ok=True)
-    img_dump = os.path.join(root, 'results', 'viz_gt')
+
+
+    colour = {'rankl': (1, 1, 0), 'rknee': (1, 1, 0), 'rhip': (1, 1, 0),
+              'lankl': (1, 0, 1), 'lknee': (1, 0, 1), 'lhip': (1, 0, 1), 'pelvis': (0, 1, 0),
+              'rwri': (1, 0, 0), 'relb': (1, 0, 0), 'rsho': (1, 0, 0),
+              'lwri': (0, 1, 1), 'lelb': (0, 1, 1), 'lsho': (0, 1, 1),
+              'head': (0, 1, 1), 'neck': (0, 1, 1), 'thorax': (0, 1, 0)}
+
+    os.makedirs(os.path.join(save_dir, 'skeleton_visualizations'), exist_ok=True)
+    img_dump = os.path.join(save_dir, 'skeleton_visualizations')
 
     # Currently will iterate over MPII and LSPET and LSP
     for dataset_name_ in image_info.keys():
@@ -49,31 +61,46 @@ def visualize_image(image_info, bbox=False, uv=False):
             img_name = image_info[dataset_name_]['img_name'][i]
             img_pred = image_info[dataset_name_]['img_pred'][i]
             img_gt = image_info[dataset_name_]['img_gt'][i]
-            img_split = image_info[dataset_name_]['split'][i]
             img_dataset = image_info[dataset_name_]['dataset'][i]
+            img_string = image_info[dataset_name_]['display_string'][i]
 
             # One list for each, ground truth and predictions
             text_overlay = []
-            ax.set_title('Name: {}, Shape: {}, Split: {}, Dataset: {}'.format(img_name, str(img.shape), img_split, img_dataset),
-                         color='white')
+            ax.set_title('Name: {}, Shape: {}, Dataset: {}'.format(img_string, str(img.shape), img_dataset),
+                         color='orange')
             ax.imshow(img)
+
+
+            if dataset_name_ == 'mpii':
+                skeleton = mpii_skelton
+            else:
+                assert dataset_name_ == 'lsp' or dataset_name_ == 'lspet'
+                skeleton = lsp_skeleton
+
+            for link in skeleton:
+                joint_1_name = link[0]
+                joint_2_name = link[1]
+                color = link[2]
+
+                joint_1 = img_pred[joint_1_name][0]
+                joint_2 = img_pred[joint_2_name][0]
+
+                if joint_1[2] == 1 and joint_2[2] == 1:
+                    joint_1 = uv_to_xy(joint_1)
+                    joint_2 = uv_to_xy(joint_2)
+
+                    ax.plot([joint_1[0], joint_2[0]], [joint_1[1], joint_2[1]], color=color)
+
 
             joint_names = list(colour.keys())
             for jnt in joint_names:
+                if (dataset_name_ in ['lsp', 'lspet']) and (jnt in ['pelvis', 'thorax']):
+                    continue
                 for jnt_gt in img_gt[jnt]:
-                    if jnt_gt[2] == 1:
-                        if uv:
-                            jnt_gt = uv_to_xy(jnt_gt)
+                    if jnt_gt[2] >= 0 and jnt_gt[1] >= 0 and jnt_gt[0] >= 0:
+                        jnt_gt = uv_to_xy(jnt_gt)
                         text_overlay.append(ax.text(x=jnt_gt[0], y=jnt_gt[1], s=jnt, color=colour[jnt], fontsize=6))
-                        ax.add_patch(Circle(jnt_gt[:2], radius=2.5, color=colour[jnt], fill=False))
-
-            for jnt in joint_names:
-                for jnt_pred in img_pred[jnt]:
-                    if jnt_pred[2] == 1:
-                        if uv:
-                            jnt_pred = uv_to_xy(jnt_pred)
-                        text_overlay.append(ax.text(x=jnt_pred[0], y=jnt_pred[1], s=jnt, color=colour[jnt], fontsize=6))
-                        ax.add_patch(Circle(jnt_pred[:2], radius=2.5, color=colour[jnt], fill=True))
+                        ax.add_patch(Circle(jnt_gt[:2], radius=1.5, color=colour[jnt], fill=False))
 
             if bbox:
                 for person_patch in range(image_info[dataset_name_]['bbox_coords'].shape[1]):
@@ -81,16 +108,17 @@ def visualize_image(image_info, bbox=False, uv=False):
                     ax.add_patch(Rectangle(xy=(coords[0], coords[1]), height=(coords[3] - coords[1]), width=(coords[2]-coords[0]),
                                            linewidth=1, edgecolor='r', fill=False))
 
-            adjust_text(text_overlay)
+            if adjusttext:
+                adjust_text(text_overlay)
 
-            plt.savefig(fname=os.path.join(img_dump, '{}'.format(img_name)),
-                        facecolor='black', edgecolor='black', bbox_inches='tight', dpi=300)
+            plt.savefig(fname=os.path.join(img_dump, '{}'.format(img_string)),
+                        facecolor='black', edgecolor='black', bbox_inches='tight', dpi=500)
 
             del fig, ax
             plt.close()
 
 
-def heatmap_loss(combined_hm_preds, heatmaps, nstack, egl=False):
+def heatmap_loss(combined_hm_preds, heatmaps, egl=False):
     '''
 
     :param combined_hm_preds:
@@ -99,16 +127,18 @@ def heatmap_loss(combined_hm_preds, heatmaps, nstack, egl=False):
     :return:
     '''
 
+    calc_loss = lambda pred, gt: ((pred - gt) ** 2).mean(dim=[1, 2, 3])
+
     combined_loss = []
-    calc_loss = lambda pred, gt:  ((pred - gt)**2).mean(dim=[1, 2, 3])
+    nstack = combined_hm_preds.shape[1]
 
     for i in range(nstack):
         if egl:
-            combined_loss.append(calc_loss(combined_hm_preds[:, i], heatmaps[:, i]))
+            combined_loss.append(calc_loss(combined_hm_preds[:, i], heatmaps[:, i].to(combined_hm_preds[:, i].device)))
         else:
-            combined_loss.append(calc_loss(combined_hm_preds[:, i], heatmaps))
-    combined_loss = torch.stack(combined_loss, dim=1)
+            combined_loss.append(calc_loss(combined_hm_preds[:, i], heatmaps.to(combined_hm_preds[:, i].device)))
 
+    combined_loss = torch.stack(combined_loss, dim=1)
     return combined_loss
 
 
@@ -119,7 +149,7 @@ def heatmap_generator(joints, occlusion, hm_shape=(0, 0), img_shape=(0, 0)):
     :return:
     '''
 
-    def draw_heatmap(pt_uv, sigma=1.75, use_occlusion=False, hm_shape=(0, 0)):
+    def draw_heatmap(pt_uv, use_occlusion, hm_shape, sigma=1.75):
         '''
         2D gaussian (exponential term only) centred at given point.
         No constraints on point to be integer only.
@@ -131,20 +161,19 @@ def heatmap_generator(joints, occlusion, hm_shape=(0, 0), img_shape=(0, 0)):
 
         im = np.zeros(hm_shape, dtype=np.float32)
 
-        # If coordinates are negative OR coordinates affined beyond visibility OR joint is absent
-        if (pt_uv[2] == -1) or (pt_uv[0] < 0) or (pt_uv[1] < 0) or (pt_uv[0] > hm_shape[0]) or (pt_uv[1] > hm_shape[1]):
+        # If joint is absent
+        if pt_uv[2] == -1:
             return im, 0
 
         elif pt_uv[2] == 0:
             if not use_occlusion:
                 return im, 0
-            pt_uv = pt_uv[:2]
 
         else:
             assert pt_uv[2] == 1, "joint[2] should be (-1, 0, 1), but got {}".format(pt_uv[2])
-            pt_uv = pt_uv[:2]
 
         # Point around which Gaussian will be centred.
+        pt_uv = pt_uv[:2]
         pt_uv_rint = np.rint(pt_uv).astype(int)
 
         # Size of 2D Gaussian window.
@@ -153,28 +182,32 @@ def heatmap_generator(joints, occlusion, hm_shape=(0, 0), img_shape=(0, 0)):
         if not size % 2:
             size += 1
 
-        # Generate gaussian, with window=size and variance=sigma
-        u = np.arange(pt_uv_rint[0] - (size // 2), pt_uv_rint[0] + (size // 2) + 1)
-        v = np.arange(pt_uv_rint[1] - (size // 2), pt_uv_rint[1] + (size // 2) + 1)
-        uu, vv = np.meshgrid(u, v, sparse=True)
-        z = np.exp(-((uu - pt_uv[0]) ** 2 + (vv - pt_uv[1]) ** 2) / (2 * (sigma ** 2)))
-        z = z.T
+        # Check whether gaussian intersects with im:
+        if (pt_uv_rint[0] - (size//2) >= hm_shape[0]) or (pt_uv_rint[0] + (size//2) <= 0) \
+                or (pt_uv_rint[1] - (size//2) > hm_shape[1]) or (pt_uv_rint[1] + (size//2) < 0):
 
-        # Crop Size for upper left and bottom right coordinates
-        ul_u = min(pt_uv_rint[0], size // 2)
-        ul_v = min(pt_uv_rint[1], size // 2)
-        br_u = min((im.shape[0] - 1) - pt_uv_rint[0], size // 2)
-        br_v = min((im.shape[1] - 1) - pt_uv_rint[1], size // 2)
+            return im, 0
 
-        # Crop around the centre of the gaussian.
-        gauss_crop = z[(size // 2) - ul_u:(size // 2) + br_u + 1,
-                     (size // 2) - ul_v:(size // 2) + br_v + 1]
+        else:
+            # Generate gaussian, with window=size and variance=sigma
+            u = np.arange(pt_uv_rint[0] - (size // 2), pt_uv_rint[0] + (size // 2) + 1)
+            v = np.arange(pt_uv_rint[1] - (size // 2), pt_uv_rint[1] + (size // 2) + 1)
+            uu, vv = np.meshgrid(u, v, sparse=True)
+            z = np.exp(-((uu - pt_uv[0]) ** 2 + (vv - pt_uv[1]) ** 2) / (2 * (sigma ** 2)))
+            z = z.T
 
-        # Heatmap = crop
-        im[pt_uv_rint[0] - ul_u:pt_uv_rint[0] + br_u + 1,
-        pt_uv_rint[1] - ul_v:pt_uv_rint[1] + br_v + 1] = gauss_crop
+            # Identify indices in im that will define the crop area
+            top = max(0, pt_uv_rint[0] - (size//2))
+            bottom = min(hm_shape[0], pt_uv_rint[0] + (size//2) + 1)
+            left = max(0, pt_uv_rint[1] - (size//2))
+            right = min(hm_shape[1], pt_uv_rint[1] + (size//2) + 1)
 
-        return im, 1   # heatmap, joint_exist
+            im[top:bottom, left:right] = \
+                z[top - (pt_uv_rint[0] - (size//2)): top - (pt_uv_rint[0] - (size//2)) + (bottom - top),
+                  left - (pt_uv_rint[1] - (size//2)): left - (pt_uv_rint[1] - (size//2)) + (right - left)]
+
+            return im, 1   # heatmap, joint_exist
+
 
     assert len(joints.shape) == 3, 'Joints should be rank 3:' \
                                    '(num_person, num_joints, [u,v,vis]), but is instead {}'.format(joints.shape)
@@ -246,6 +279,26 @@ def arg_max(img):
     return torch.FloatTensor([max_u, max_v])
 
 
+def fast_argmax(_heatmaps):
+    """
+    Direct argmax from the heatmap, does not perform smoothing of heatmaps
+    :param _heatmaps:
+    :return:
+    """
+    batch_size = _heatmaps.shape[0]
+    num_jnts = _heatmaps.shape[1]
+    spatial_dim = _heatmaps.shape[3]
+    assert _heatmaps.shape[2] == _heatmaps.shape[3]
+
+    assert len(_heatmaps.shape) == 4, "Heatmaps should be of shape: BatchSize x num_joints x 64 x64"
+    _heatmaps = _heatmaps.reshape(batch_size, num_jnts, -1)
+    indices = torch.argmax(_heatmaps, dim=2)
+    indices = torch.cat(((indices // spatial_dim).view(batch_size, num_jnts, 1),
+                         (indices % spatial_dim).view(batch_size, num_jnts, 1)),
+                        dim=2)
+    return indices.type(torch.float32)
+
+
 def weight_avg_centre(hm, max_uv=None, jnt_size=1.75):
     '''
     Weighted average of points around the maxima. Weighted average avoids solitary spikes being identified.
@@ -315,3 +368,26 @@ def shannon_entropy(probs):
     :return: Scalar; H(p)
     '''
     return torch.sum(-probs * torch.log(probs), dim=1)
+
+
+def count_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+def get_pairwise_joint_distances(heatmaps):
+    '''
+        Computes pairwise distances between joints, given a batch of heatmaps
+        - param heatmaps: Tensor of size (batch_size, num_joints, hm_size, hm_size)
+        - return pairwise_dists: List[2D lists]
+                                    - length = batch_size
+                                    - Each 2D List (pairwise distances) of dim [num_joints,num_joints]
+    '''
+
+    # Batch Size, num_jnts, 64, 64
+    assert heatmaps.dim() == 4, 'Dimension of input heatmaps must be 4 but was {}'.format(heatmaps.shape)
+
+    # Batch Size, num_jnts, 2
+    joint_uv = fast_argmax(heatmaps)
+    pairwise_dists = torch.cdist(joint_uv, joint_uv)
+
+    return pairwise_dists

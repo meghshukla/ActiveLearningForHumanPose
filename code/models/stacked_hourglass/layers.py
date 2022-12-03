@@ -1,3 +1,4 @@
+import torch
 from torch import nn
 
 Pool = nn.MaxPool2d
@@ -89,8 +90,12 @@ class Hourglass(nn.Module):
     '''
 
     '''
-    def __init__(self, n, f, bn=None, increase=0):
+    def __init__(self, n, f, bn=None, increase=0, intermediate_features=None, auxnet=None):
         super(Hourglass, self).__init__()
+
+        self.auxnet = auxnet
+        self.intermediate_features = intermediate_features
+
         nf = f + increase
         self.up1 = Residual(f, f)
         # Lower branch
@@ -99,7 +104,8 @@ class Hourglass(nn.Module):
         self.n = n
         # Recursive hourglass
         if self.n > 1:
-            self.low2 = Hourglass(n-1, nf, bn=bn)
+            self.low2 = Hourglass(n=n-1, f=nf, bn=bn, increase=0,
+                                  intermediate_features=intermediate_features, auxnet=auxnet)
         else:
             self.low2 = Residual(nf, nf)
         self.low3 = Residual(nf, f)
@@ -119,17 +125,20 @@ class Hourglass(nn.Module):
             x = self.low2(x)
         x = self.low3(x)
 
-        hourglass_feat = self.avg_pool(x).clone().detach().view(x.shape[0], -1)  # Shape: BS x num_feat
-        hourglass_feature_map = x.clone().detach()
+        if self.intermediate_features == 'conv' and self.auxnet:
+            hourglass_feature_map = x.clone().detach().to('cuda:{}'.format(torch.cuda.device_count() - 1))
 
         upper_2 = self.up2(x)
 
         if self.n > 1:
 
             hourglass_dict['out'] = upper_1 + upper_2
-            hourglass_dict[self.n] = hourglass_feat
-            hourglass_dict['feature_{}'.format(self.n)] = hourglass_feature_map
+            if self.intermediate_features == 'conv' and self.auxnet:
+                hourglass_dict['feature_{}'.format(self.n)] = hourglass_feature_map
 
             return hourglass_dict
         else:
-            return {'out': upper_1 + upper_2, self.n: hourglass_feat, 'feature_1': hourglass_feature_map}
+            if self.intermediate_features == 'conv' and self.auxnet:
+                return {'out': upper_1 + upper_2, 'feature_1': hourglass_feature_map}
+            else:
+                return {'out': upper_1 + upper_2}

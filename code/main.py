@@ -2,6 +2,7 @@ import os
 import copy
 import logging
 
+import cv2
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
@@ -13,97 +14,95 @@ from torch.utils.tensorboard import SummaryWriter
 from torch.optim.lr_scheduler import ReduceLROnPlateau as ReduceLROnPlateau
 
 from config import ParseConfig
+from utils import fast_argmax
 from utils import visualize_image
 from utils import heatmap_loss
+from utils import count_parameters
+from utils import get_pairwise_joint_distances
 from activelearning import ActiveLearning
+from activelearning_viz import ActiveLearning_Visualization
 from dataloader import load_hp_dataset
-from dataloader import Dataset_MPII_LSPET_LSP
+from dataloader import HumanPoseDataLoader
 from evaluation import PercentageCorrectKeypoint
-from models.learning_loss.LearningLoss import LearnLossActive
+from models.auxiliary.AuxiliaryNet import AuxNet
+from models.hrnet.pose_hrnet import PoseHighResolutionNet as HRNet
 from models.stacked_hourglass.StackedHourglass import PoseNet as Hourglass
 
 # Global declarations
+torch.backends.cudnn.benchmark = True
+torch.backends.cudnn.enabled = True
 logging.getLogger().setLevel(logging.INFO)
 os.chdir(os.path.dirname(os.path.realpath(__file__)))
 
 
 class Train(object):
-    def __init__(self, network, learnloss, hyperparameters, dataset_obj, conf, tb_writer):
-        '''
-        Class for training the model
-        Training will train the Hourglass module
+    def __init__(self, pose_model, aux_net, hyperparameters, dataset_obj, conf, tb_writer):
+        """
+        Class for training the human pose and aux_net model
 
-        :param network: (torch.nn) Hourglass model
-        :param llal_ntwk: (torch.nn) Learning Loss model
+        :param pose_model: (torch.nn) Human pose model
+        :param aux_net: (torch.nn) Auxiliary network
         :param hyperparameters: (dict) Various hyperparameters used in training
-        :param loc_object: (Object of LocalizationLoader) Controls the data fed into torch_dataloader
-        :param model_save_path (string) The path directory where the training output will be logged.
+        :param dataset_obj: (torch.utils.data.Dataset)
         :param conf: (Object of ParseConfig) Contains the configurations for the model
         :param tb_writer: (Object of SummaryWriter) Tensorboard writer to log values
-        :param wt_reg: (Bool) Whether to use weight regularization or not
-        '''
+        """
 
-        # Dataset Settings
+        self.conf = conf
+        self.aux_net = aux_net
+        self.network = pose_model
+        self.tb_writer = tb_writer
         self.dataset_obj = dataset_obj
-        self.tb_writer = tb_writer                                           # Tensorboard writer
-        self.network = network                                               # Hourglass network
-        self.batch_size = conf.batch_size
-        self.epoch = hyperparameters['num_epochs']
         self.hyperparameters = hyperparameters
-        self.model_save_path = conf.model_save_path
-        self.optimizer = hyperparameters['optimizer']                        # Adam / SGD
-        self.loss_fn = hyperparameters['loss_fn']                            # MSE
-        self.learning_rate = hyperparameters['optimizer_config']['lr']
-        self.start_epoch = hyperparameters['start_epoch']                    # Used in case of resume training
-        self.num_hm = conf.num_hm                                            # Number of heatmaps
-        self.joint_names = self.dataset_obj.ind_to_jnt
-        self.hg_depth = 4                                                    # Depth of hourglass
-        self.n_stack = conf.n_stack
 
-        self.train_learning_loss = conf.train_learning_loss
-        self.learnloss_network = learnloss
-        self.learnloss_margin = conf.learning_loss_margin
-        self.learnloss_warmup = conf.learning_loss_warmup
-        self.learnloss_original = conf.learning_loss_original
-        self.learnloss_obj = conf.learning_loss_obj
+        # Experiment Settings
+        self.batch_size = conf.experiment_settings['batch_size']
+        self.epoch = hyperparameters['num_epochs']
+        self.optimizer = hyperparameters['optimizer']  # Adam / SGD
+        self.loss_fn = hyperparameters['loss_fn']  # MSE
+        self.learning_rate = hyperparameters['optimizer_config']['lr']
+        self.start_epoch = hyperparameters['start_epoch']  # Used in case of resume training
+        self.num_hm = conf.experiment_settings['num_hm']  # Number of heatmaps
+        self.joint_names = self.dataset_obj.ind_to_jnt
+        self.model_save_path = conf.model['save_path']
+        self.train_aux_net = conf.model['aux_net']['train']
+
 
         # Stacked Hourglass scheduling
-        if self.train_learning_loss:
-            min_lr = [0.000003, conf.lr]
+        if self.train_aux_net:
+            min_lr = [0.000003, conf.experiment_settings['lr']]
         else:
             min_lr = 0.000003
 
-        self.scheduler = ReduceLROnPlateau(self.optimizer, factor=0.5, patience=8, cooldown=2, min_lr=min_lr, verbose=True)
+        self.scheduler = ReduceLROnPlateau(self.optimizer, factor=0.5, patience=5, cooldown=2, min_lr=min_lr, verbose=True)
 
         self.torch_dataloader = torch.utils.data.DataLoader(self.dataset_obj, self.batch_size,
-                                                            shuffle=True, num_workers=8, drop_last=True)
-
-        if torch.cuda.device_count() > 1:
-            cuda_devices = [torch.device('cuda:0'), torch.device('cuda:1')]
-        else:
-            cuda_devices = [torch.device('cuda:0'), torch.device('cuda:0')]
-
-        self.cuda_devices = cuda_devices
-        if conf.learnloss_only:
-            self.train_hg_bool = torch.tensor(0.0).cuda(cuda_devices[-1])
-        else:
-            self.train_hg_bool = torch.tensor(1.0).cuda(cuda_devices[-1])
+                                                            shuffle=True, num_workers=2, drop_last=True)
 
 
     def train_model(self):
-        '''
-        Training Loop: Hourglass and/or Learning Loss
-        :return: None
-        '''
+        """
+        Training loop
+        :return:
+        """
 
-        print("Initializing training: Epochs - {}\tBatch Size - {}".format(self.hyperparameters['num_epochs'],
-                                                                           self.batch_size))
+        print("Initializing training: Epochs - {}\tBatch Size - {}".format(
+            self.hyperparameters['num_epochs'], self.batch_size))
 
-        best_val_hg = np.inf
-        best_val_learnloss = np.inf
-        best_epoch_hg = -1
-        best_epoch_learnloss = -1
-        global_step = 0
+        # 'mean_loss_validation': {'Pose': validation_loss_pose, 'AuxNet': validation_aux_net}
+        if self.conf.resume_training:
+            best_val_pose = self.hyperparameters['mean_loss_validation']['Pose']
+            best_val_auxnet = self.hyperparameters['mean_loss_validation']['AuxNet']
+            best_epoch_pose = self.hyperparameters['start_epoch']
+            best_epoch_auxnet = -1
+            global_step = 0
+
+        else:
+            best_val_pose = np.inf
+            best_val_auxnet = np.inf
+            best_epoch_pose = -1
+            best_epoch_auxnet = -1
+            global_step = 0
 
         # Variable to store all the loss values for logging
         loss_across_epochs = []
@@ -111,12 +110,12 @@ class Train(object):
 
         for e in range(self.start_epoch, self.epoch):
             epoch_loss = []
-            epoch_loss_learnloss = []
+            epoch_loss_aux_net = []
 
             # Network alternates between train() and validate()
             self.network.train()
-            if self.train_learning_loss:
-                self.learnloss_network.train()
+            if self.train_aux_net:
+                self.aux_net.train()
 
             self.dataset_obj.input_dataset(train=True)
 
@@ -126,146 +125,144 @@ class Train(object):
 
                 assert split[0] == 0, "Training split should be 0."
 
-                gt_per_image = gt_per_image.to(non_blocking=True, device=self.cuda_devices[-1])
-
-                # Will clear the gradients of hourglass
                 self.optimizer.zero_grad()
-                outputs, hourglass_features = self.network(images)
+                outputs, pose_features = self.network(images)          # images.cuda() done internally within the model
+                loss = heatmap_loss(outputs, heatmaps)                 # heatmaps transferred to GPU within the function
 
-                heatmaps = heatmaps.to(non_blocking=True, device=self.cuda_devices[-1])
-                loss = heatmap_loss(outputs, heatmaps, self.n_stack)
+                if self.conf.model['aux_net']['train'] and self.conf.model['aux_net']['method'] == 'learning_loss':
+                    learning_loss_ = loss.clone().detach().to('cuda:{}'.format(torch.cuda.device_count() - 1))
+                    learning_loss_ = torch.mean(learning_loss_, dim=[1])
 
-                learning_loss_ = loss.clone().detach()
-                learning_loss_ = torch.mean(learning_loss_, dim=[1])
+                    loss_learnloss = self.learning_loss(pose_encodings=pose_features, true_loss=learning_loss_,
+                                                        gt_per_img=gt_per_image, epoch=e)
+                    loss_learnloss.backward()
+                    epoch_loss_aux_net.append(loss_learnloss.item())
 
-                loss = (torch.mean(loss)) * self.train_hg_bool
-                self.tb_writer.add_scalar('Train/Loss_batch', torch.mean(loss), global_step)
+
+                if self.conf.model['aux_net']['train'] and self.conf.model['aux_net']['method'] == 'aleatoric':
+                    loss_aleatoric = self.aleatoric_uncertainty(pose_encodings=pose_features, outputs=outputs,
+                                                                heatmaps=heatmaps, joint_exist=joint_exist, epoch=e)
+                    loss_aleatoric.backward()
+                    epoch_loss_aux_net.append(loss_aleatoric.item())
+
+                if self.conf.model['aux_net']['train'] and self.conf.model['aux_net']['method'] == 'vl4pose':
+                    loss_vl4pose = self.vl4pose(pose_encodings=pose_features, heatmaps=heatmaps, 
+                                                joint_exist=joint_exist, epoch=e)
+                    loss_vl4pose.backward()
+                    epoch_loss_aux_net.append(loss_vl4pose.item())
+
+
+                if self.conf.model['aux_net']['train_auxnet_only']:
+                    loss = torch.mean(loss) * 0
+                else:
+                    loss = torch.mean(loss)
 
                 loss.backward()
-
-                # Train the learning loss network
-                if self.train_learning_loss:
-                    loss_learnloss = self.learning_loss(hourglass_features, learning_loss_, self.learnloss_margin, gt_per_image, e)
-                    loss_learnloss.backward()
-                    epoch_loss_learnloss.append(loss_learnloss.cpu().data.numpy())
+                if self.conf.tensorboard:
+                    self.tb_writer.add_scalar('Train/Loss_batch', torch.mean(loss), global_step)
+                epoch_loss.append(loss.item())
 
                 # Weight update
                 self.optimizer.step()
                 global_step += 1
 
-                # Store the loss per batch
-                epoch_loss.append(loss.cpu().data.numpy())
 
+            # Epoch training ends -------------------------------------------------------------------------------------
             epoch_loss = np.mean(epoch_loss)
-            if self.train_learning_loss:
-                epoch_loss_learnloss = np.mean(epoch_loss_learnloss)
 
-            # Returns average validation loss per element
-            if self.train_learning_loss:
-                validation_loss_hg, validation_learning_loss = self.validation(e)
+            if self.conf.model['aux_net']['train']:
+                epoch_loss_aux_net = np.mean(epoch_loss_aux_net)
+                validation_loss_pose, validation_aux_net = self.validation(e)
             else:
-                validation_loss_hg = self.validation(e)
-                validation_learning_loss = 0.0
+                validation_loss_pose = self.validation(e)
+                validation_aux_net = 0.0
 
-            # Learning rate scheduler on the HourGlass validation loss
-            self.scheduler.step(validation_loss_hg)
+            # Learning rate scheduler on the Human Pose validation loss
+            self.scheduler.step(validation_loss_pose)
 
             # TensorBoard Summaries
-            self.tb_writer.add_scalar('Train', torch.Tensor([epoch_loss]), global_step)
-            self.tb_writer.add_scalar('Validation/HG_Loss', torch.Tensor([validation_loss_hg]), global_step)
-            if self.train_learning_loss:
-                self.tb_writer.add_scalar('Validation/Learning_Loss', torch.Tensor([validation_learning_loss]), global_step)
+            if self.conf.tensorboard:
+                self.tb_writer.add_scalar('Train', torch.tensor([epoch_loss]), global_step)
+                self.tb_writer.add_scalar('Validation/HG_Loss', torch.tensor([validation_loss_pose]), global_step)
+                if self.conf.model['aux_net']['train']:
+                    self.tb_writer.add_scalar('Validation/Learning_Loss', torch.tensor([validation_aux_net]), global_step)
 
-            # Save the model
-            torch.save(self.network.state_dict(),
-                       self.model_save_path.format("model_epoch_{}.pth".format(e + 1)))
-
-            if self.train_learning_loss:
-                torch.save(self.learnloss_network.state_dict(),
-                           self.model_save_path.format("model_epoch_{}_learnloss.pth".format(e + 1)))
-
-            # For resume training ONLY:
-            # If learn_loss, then optimizer will have two param groups
-            # Hence during load, ensure llal module is loaded/not loaded
-            torch.save({'epoch': e + 1,
-                        'optimizer_load_state_dict': self.optimizer.state_dict(),
-                        'mean_loss': epoch_loss,
-                        'mean_loss_validation': {'HG': validation_loss_hg, 'LearningLoss': validation_learning_loss},
-                        'learn_loss': self.train_learning_loss},
-                        self.model_save_path.format("optim_epoch_{}.tar".format(e + 1)))
 
             # Save if best model
-            if best_val_hg > validation_loss_hg:
+            if best_val_pose > validation_loss_pose:
                 torch.save(self.network.state_dict(),
-                           self.model_save_path.format("best_model.pth"))
+                           os.path.join(self.model_save_path, 'model_checkpoints/pose_net.pth'))
 
-                torch.save(self.learnloss_network.state_dict(),
-                           self.model_save_path.format("best_model_learnloss_hg.pth"))
+                if self.conf.model['aux_net']['train']:
+                    torch.save(
+                        self.aux_net.state_dict(),
+                        os.path.join(self.model_save_path,
+                                     'model_checkpoints/aux_net_{}_BestPose.pth'.format(self.conf.model['aux_net']['method'])))
 
-                best_val_hg = validation_loss_hg
-                best_epoch_hg = e + 1
+                best_val_pose = validation_loss_pose
+                best_epoch_pose = e + 1
 
                 torch.save({'epoch': e + 1,
                             'optimizer_load_state_dict': self.optimizer.state_dict(),
                             'mean_loss_train': epoch_loss,
-                            'mean_loss_validation': {'HG': validation_loss_hg, 'LearningLoss': validation_learning_loss},
-                            'learn_loss': self.train_learning_loss},
-                           self.model_save_path.format("optim_best_model.tar"))
+                            'mean_loss_validation': {'Pose': validation_loss_pose, 'AuxNet': validation_aux_net},
+                            'aux_net': self.conf.model['aux_net']['train']},
+                           os.path.join(self.model_save_path, 'model_checkpoints/optim_best_model.tar'))
 
-            if self.train_learning_loss:
-                if best_val_learnloss > validation_learning_loss and validation_learning_loss != 0.0:
-                    torch.save(self.learnloss_network.state_dict(),
-                               self.model_save_path.format("best_model_learnloss_{}.pth".format(self.learnloss_obj)))
 
-                    best_val_learnloss = validation_learning_loss
-                    best_epoch_learnloss = e + 1
+            if self.conf.model['aux_net']['train']:
+                if (best_val_auxnet > validation_aux_net) and (validation_aux_net != 0.0):
+                    torch.save(self.aux_net.state_dict(),
+                               os.path.join(self.model_save_path, 'model_checkpoints/aux_net_{}.pth'.format(self.conf.model['aux_net']['method'])))
 
-            print("Loss at epoch {}/{}: (train) {}\t"
-                  "Learning Loss: (train) {}\t"
-                  "(validation: HG) {}\t"
-                  "(Validation: Learning Loss) {}\t"
+                    best_val_auxnet = validation_aux_net
+                    best_epoch_auxnet = e + 1
+
+            print("Loss at epoch {}/{}: (train:Pose) {}\t"
+                  "(train:AuxNet) {}\t"
+                  "(validation:Pose) {}\t"
+                  "(Validation:AuxNet) {}\t"
                   "(Best Model) {}".format(
                 e+1,
                 self.epoch,
                 epoch_loss,
-                epoch_loss_learnloss,
-                validation_loss_hg,
-                validation_learning_loss,
-                best_epoch_hg))
+                epoch_loss_aux_net,
+                validation_loss_pose,
+                validation_aux_net,
+                best_epoch_pose))
 
             loss_across_epochs.append(epoch_loss)
-            validation_across_epochs.append(validation_loss_hg)
+            validation_across_epochs.append(validation_loss_pose)
 
             # Save the loss values
-            f = open(self.model_save_path.format("loss_data.txt"), "w")
-            f_ = open(self.model_save_path.format("validation_data.txt"), "w")
+            f = open(os.path.join(self.model_save_path, 'model_checkpoints/loss_data.txt'), "w")
+            f_ = open(os.path.join(self.model_save_path, 'model_checkpoints/validation_data.txt'), "w")
             f.write("\n".join([str(lsx) for lsx in loss_across_epochs]))
             f_.write("\n".join([str(lsx) for lsx in validation_across_epochs]))
             f.close()
             f_.close()
 
-        self.tb_writer.close()
-        logging.info("Model training completed\nBest validation loss (HG): {}\tBest Epoch: {}"
-                     "\nBest validation loss (LLAL): {}\tBest Epoch: {}".format(
-            best_val_hg, best_epoch_hg, best_val_learnloss, best_epoch_learnloss))
+        if self.conf.tensorboard:
+            self.tb_writer.close()
+        logging.info("Model training completed\nBest validation loss (Pose): {}\tBest Epoch: {}"
+                     "\nBest validation loss (AuxNet): {}\tBest Epoch: {}".format(
+            best_val_pose, best_epoch_pose, best_val_auxnet, best_epoch_auxnet))
 
 
     def validation(self, e):
-        '''
-        Validation loss
-        :param e: (int) Epoch
-        :return: (Float): Mean validation loss per batch for Hourglass and Learning Loss (if LL activated in inc_config file.)
-        '''
+        """
+
+        :param e: Epoch
+        :return:
+        """
         with torch.no_grad():
             # Stores the loss for all batches
-            epoch_val_hg = []
-
-            if self.train_learning_loss:
-                epoch_val_learnloss = []
-
+            epoch_val_pose = []
             self.network.eval()
-            if self.train_learning_loss:
-                self.learnloss_network.eval()
+
+            if self.conf.model['aux_net']['train']:
+                epoch_val_auxnet = []
+                self.aux_net.eval()
 
             # Augmentation only needed in Training
             self.dataset_obj.input_dataset(validate=True)
@@ -276,65 +273,52 @@ class Train(object):
 
                 assert split[0] == 1, "Validation split should be 1."
 
-                gt_per_img = gt_per_img.to(non_blocking=True, device=self.cuda_devices[-1])
+                outputs, pose_features = self.network(images)
+                loss_val_pose = heatmap_loss(outputs, heatmaps)
 
-                outputs, hourglass_features = self.network(images)
+                if self.conf.model['aux_net']['train'] and self.conf.model['aux_net']['method'] == 'learning_loss':
+                    learning_loss_val = loss_val_pose.clone().detach().to('cuda:{}'.format(torch.cuda.device_count() - 1))
+                    learning_loss_val = torch.mean(learning_loss_val, dim=[1])
+                    loss_val_auxnet = self.learning_loss(pose_features, learning_loss_val, gt_per_img, e)
+                    epoch_val_auxnet.append(loss_val_auxnet.item())
 
-                heatmaps = heatmaps.to(non_blocking=True, device=self.cuda_devices[-1])
+                if self.conf.model['aux_net']['train'] and self.conf.model['aux_net']['method'] == 'aleatoric':
+                    loss_val_aleatoric = self.aleatoric_uncertainty(pose_encodings=pose_features, outputs=outputs,
+                                                                heatmaps=heatmaps, joint_exist=joint_exist, epoch=e)
+                    epoch_val_auxnet.append(loss_val_aleatoric.item())
 
-                loss_val_hg = heatmap_loss(outputs, heatmaps, self.n_stack)
+                if self.conf.model['aux_net']['train'] and self.conf.model['aux_net']['method'] == 'vl4pose':
+                    vl4pose_loss = self.vl4pose(pose_encodings=pose_features, heatmaps=heatmaps, joint_exist=joint_exist, epoch=e)
+                    epoch_val_auxnet.append(vl4pose_loss.item())
 
-                learning_loss_val = loss_val_hg.clone().detach()
-                learning_loss_val = torch.mean(learning_loss_val, dim=[1])
 
-                loss_val_hg = torch.mean(loss_val_hg)
-                epoch_val_hg.append(loss_val_hg.cpu().data.numpy())
+                loss_val_pose = torch.mean(loss_val_pose)
+                epoch_val_pose.append(loss_val_pose.item())
 
-                if self.train_learning_loss:
-                    loss_val_learnloss = self.learning_loss(hourglass_features, learning_loss_val, self.learnloss_margin, gt_per_img, e)
-                    epoch_val_learnloss.append(loss_val_learnloss.cpu().data.numpy())
-
-            print("Validation Loss HG at epoch {}/{}: {}".format(e+1, self.epoch, np.mean(epoch_val_hg)))
-
-            if self.train_learning_loss:
-                print("Validation Learning Loss at epoch {}/{}: {}".format(e+1, self.epoch, np.mean(epoch_val_learnloss)))
-                return np.mean(epoch_val_hg), np.mean(epoch_val_learnloss)
+            if self.conf.model['aux_net']['train']:
+                return np.mean(epoch_val_pose), np.mean(epoch_val_auxnet)
 
             else:
-                return np.mean(epoch_val_hg)
+                return np.mean(epoch_val_pose)
 
 
-    def learning_loss(self, hg_encodings, true_loss, margin, gt_per_img, epoch):
+    def learning_loss(self, pose_encodings, true_loss, gt_per_img, epoch):
         '''
         Learning Loss module
-        Refer:
-        1. "Learning Loss For Active Learning, CVPR 2019"
-        2. "A Mathematical Analysis of Learning Loss for Active Learning in Regression, CVPRW 2021"
+        Based on the paper: "Learning Loss For Active Learning, CVPR 2019" and "A Mathematical Analysis of Learning Loss for Active Learning in Regression, CVPR-W 2021"
 
-        :param hg_encodings: (Dict of tensors) Intermediate (Hourglass) and penultimate layer output of the Hourglass network
-        :param true_loss: (Tensor of shape [Batch Size]) Loss computed from HG prediction and ground truth
-        :param margin: (scalar) tolerance margin between predicted losses
+        :param pose_encodings: (Dict of tensors) Intermediate (Hourglass) and penultimate layer output of the M10 network
+        :param true_loss: (Tensor of shape [Batch Size]) Loss computed from M10 prediction and ground truth
         :param gt_per_img: (Tensor, shape [Batch Size]) Number of ground truth per image
         :param epoch: (scalar) Epoch, used in learning loss warm start-up
         :return: (Torch scalar tensor) Learning Loss
         '''
 
-        # Concatenate the layers instead of a linear combination
-        with torch.no_grad():
-            if self.learnloss_original:
-                # hg_depth == 4 means depth is {1, 2, 3, 4}. If we want depth 5, range --> (1, 4+2)
-                # encodings = torch.cat([hg_encodings[depth] for depth in range(1, self.hg_depth + 2)], dim=-1)
-                encodings = hg_encodings['penultimate']
+        learnloss_margin = self.conf.active_learning['learningLoss']['margin']
+        learnloss_objective = self.conf.active_learning['learningLoss']['objective']
+        learnloss_warmup = self.conf.model['aux_net']['warmup']
 
-            else:
-                # No longer concatenating, will now combine features through convolutional layers
-                encodings = torch.cat([hg_encodings['feature_5'].reshape(self.batch_size, hg_encodings['feature_5'].shape[1], -1),               # 64 x 64
-                                       hg_encodings['feature_4'].reshape(self.batch_size, hg_encodings['feature_4'].shape[1], -1),               # 32 x 32
-                                       hg_encodings['feature_3'].reshape(self.batch_size, hg_encodings['feature_3'].shape[1], -1),               # 16 x 16
-                                       hg_encodings['feature_2'].reshape(self.batch_size, hg_encodings['feature_2'].shape[1], -1),               # 8 x 8
-                                       hg_encodings['feature_1'].reshape(self.batch_size, hg_encodings['feature_1'].shape[1], -1)], dim=2)       # 4 x 4
-
-        emperical_loss, encodings = self.learnloss_network(encodings)
+        emperical_loss = self._aux_net_inference(pose_encodings)
         emperical_loss = emperical_loss.squeeze()
 
         assert emperical_loss.shape == true_loss.shape, "Mismatch in Batch size for true and emperical loss"
@@ -344,8 +328,7 @@ class Train(object):
             # To prevent DivideByZero. PyTorch does not throw an exception to DivideByZero
             gt_per_img = torch.sum(gt_per_img, dim=1)
             gt_per_img += 0.1
-            if self.learnloss_obj == 'prob':
-                true_loss = true_loss / gt_per_img
+            true_loss = true_loss / gt_per_img.to(true_loss.device)
 
             # Splitting into pairs: (i, i+half)
             half_split = true_loss.shape[0] // 2
@@ -356,31 +339,150 @@ class Train(object):
         emp_loss_i = emperical_loss[: (emperical_loss.shape[0] // 2)]
         emp_loss_j = emperical_loss[(emperical_loss.shape[0] // 2): 2 * (emperical_loss.shape[0] // 2)]
 
-        # Loss according to CVPR '19
-        if self.learnloss_obj == 'pair':
+        # Pair wise loss as mentioned in the original paper
+        if learnloss_objective == 'YooAndKweon':
             loss_sign = torch.sign(true_loss_i - true_loss_j)
             loss_emp = (emp_loss_i - emp_loss_j)
 
             # Learning Loss objective
-            llal_loss = torch.max(torch.zeros(half_split, device=loss_sign.device), (-1 * (loss_sign * loss_emp)) + margin)
+            llal_loss = torch.max(torch.zeros(half_split, device=loss_sign.device), (-1 * (loss_sign * loss_emp)) + learnloss_margin)
 
-        # Loss according to CVPR '21
-        elif self.learnloss_obj == 'prob':
+        # Computing loss over the entire batch using softmax.
+        elif learnloss_objective == 'KLdivergence':
+            # Removed the standardization-KL Divergence parts
             with torch.no_grad():
                 true_loss_ = torch.cat([true_loss_i.reshape(-1, 1), true_loss_j.reshape(-1, 1)], dim=1)
                 true_loss_scaled = true_loss_ / torch.sum(true_loss_, dim=1, keepdim=True)
 
             emp_loss_ = torch.cat([emp_loss_i.reshape(-1, 1), emp_loss_j.reshape(-1, 1)], dim=1)
             emp_loss_logsftmx = torch.nn.LogSoftmax(dim=1)(emp_loss_)
+
+            # Scaling the cross entropy loss with respect to true loss values
             llal_loss = torch.nn.KLDivLoss(reduction='batchmean')(input=emp_loss_logsftmx, target=true_loss_scaled)
-
+            #llal_loss = torch.sum((-true_loss_scaled * torch.log(emp_loss_logsftmx)), dim=1, keepdim=True)
         else:
-            raise NotImplementedError('Currently only "pair" or "prob" supported. ')
+            raise NotImplementedError('Currently only "YooAndKweon" or "KLdivergence" supported. ')
 
-        if self.learnloss_warmup <= epoch:
+        if learnloss_warmup <= epoch:
             return torch.mean(llal_loss)
         else:
             return 0.0 * torch.mean(llal_loss)
+
+
+    def aleatoric_uncertainty(self, pose_encodings, outputs, heatmaps, joint_exist, epoch):
+        """
+        Extension of Kendall and Gal's method for calculating uncertainty to human pose estimation
+        Auxiliary Network module to train sigmas for the HG/HRN network's heatmaps directly
+
+        :param pose_encodings: (Dict of tensors) Intermediate and penultimate layer outputs of the pose model
+        :param outputs: Tensor of size (batch_size, num_joints, hm_size, hm_size) Outputs of the main HG/HRN network
+        :param heatmaps: Tensor of size (batch_size, num_joints, hm_size, hm_size) Ground truth heatmaps
+        :param joint_exist: Tensor of size (batch_size, num_joints) Joint status (1=Present, 0=Absent)
+                            Present=1 may include occluded joints depending on configuration.yml setting
+        :param epoch: (scalar) Epoch, used in auxiliary network loss to compare warmp-up
+        :return: auxnet_loss: (Torch scalar tensor) auxiliary network Loss
+        """
+
+        parameters = self._aux_net_inference(pose_encodings)
+
+        # Final stack of hourglass / output of HRNet
+        outputs = outputs[:, -1].clone().detach().to('cuda:{}'.format(torch.cuda.device_count() - 1))
+        assert heatmaps.shape == outputs.shape  # Batch Size x num_joints x 64 x 64
+
+        joint_exist = joint_exist.float().to(device=parameters.device)
+
+        residual = torch.sum((fast_argmax(outputs) - fast_argmax(heatmaps).to(outputs.device))**2, dim=-1) # along axis representing u,v
+        residual = 0.5 * residual * torch.exp(-parameters)
+        neg_log_likelihood = residual + (0.5 * parameters)
+        neg_log_likelihood = neg_log_likelihood * joint_exist
+
+
+        if self.conf.model['aux_net']['warmup'] <= epoch:
+            return torch.mean(neg_log_likelihood)
+
+        else:
+            return 0.0 * torch.mean(neg_log_likelihood)
+
+
+    def vl4pose(self, pose_encodings, heatmaps, joint_exist, epoch):
+        '''
+            Train the auxiliary network for VL4Pose.
+
+            - param pose_encodings: (Dict of tensors) output from the pose network
+            - param heatmaps: Tensor of size (batch_size, num_joints, hm_size, hm_size)
+            - param joint_exist: Tensor of size (batch_size, num_joints)
+                - Joint status (1=Present, 0=Absent)
+                - Present=1 may include occluded joints depending on configuration.yml setting
+            - param epoch: (scalar) Epoch, used in auxiliary network loss warm start-up
+
+            - return auxnet_loss: (Torch scalar tensor) auxiliary network Loss
+        '''
+
+        assert joint_exist.dim() == 2, "joint_exist should be BS x num_hm, received: {}".format(joint_exist.shape)
+        j2i = self.dataset_obj.jnt_to_ind
+
+
+        if self.conf.dataset['load'] == 'mpii':
+            links = [[j2i['head'], j2i['neck']], [j2i['neck'], j2i['thorax']], [j2i['thorax'], j2i['pelvis']],
+                     [j2i['thorax'], j2i['lsho']], [j2i['lsho'], j2i['lelb']], [j2i['lelb'], j2i['lwri']],
+                     [j2i['thorax'], j2i['rsho']], [j2i['rsho'], j2i['relb']], [j2i['relb'], j2i['rwri']],
+                     [j2i['pelvis'], j2i['lhip']], [j2i['lhip'], j2i['lknee']], [j2i['lknee'], j2i['lankl']],
+                     [j2i['pelvis'], j2i['rhip']], [j2i['rhip'], j2i['rknee']], [j2i['rknee'], j2i['rankl']]]
+        else:
+            links = [[j2i['head'], j2i['neck']],
+                     [j2i['neck'], j2i['lsho']], [j2i['lsho'], j2i['lelb']], [j2i['lelb'], j2i['lwri']],
+                     [j2i['neck'], j2i['rsho']], [j2i['rsho'], j2i['relb']], [j2i['relb'], j2i['rwri']],
+                     [j2i['lsho'], j2i['lhip']], [j2i['lhip'], j2i['lknee']], [j2i['lknee'], j2i['lankl']],
+                     [j2i['rsho'], j2i['rhip']], [j2i['rhip'], j2i['rknee']], [j2i['rknee'], j2i['rankl']]]
+
+        parameters = self._aux_net_inference(pose_encodings)
+        parameters = parameters.reshape(self.batch_size, len(links), 2)
+        joint_exist = joint_exist.to(parameters.device)
+        heatmaps = heatmaps.to(parameters.device)
+
+        with torch.no_grad():
+
+            joint_distances = get_pairwise_joint_distances(heatmaps)
+            joint_exist = torch.matmul(joint_exist.unsqueeze(2).type(torch.float16), joint_exist.unsqueeze(1).type(torch.float16))
+
+            # Batch Size x num_links
+            skeleton_exist = torch.stack([joint_exist[:, u, v] for u,v in links], dim=1)
+            skeleton_distances = torch.stack([joint_distances[:, u, v] for u,v in links], dim=1)
+
+        ####
+        residual = (parameters[:, :, 0].squeeze() - skeleton_distances)**2
+        residual = 0.5 * residual * torch.exp(-parameters[:, :, 1]).squeeze()
+        neg_log_likelihood = residual + (0.5 * parameters[:, :, 1].squeeze())
+        neg_log_likelihood = neg_log_likelihood * skeleton_exist
+
+        if self.conf.model['aux_net']['warmup'] <= epoch:
+            return torch.mean(neg_log_likelihood)
+
+        else:
+            return 0.0 * torch.mean(neg_log_likelihood)
+
+
+    def _aux_net_inference(self, pose_features):
+        """
+        Common to VL4Pose, LearningLoss++ and Aleatoric which all use an auxiliary network
+        """
+        extractor = self.conf.architecture['aux_net']['conv_or_avg_pooling']
+
+        with torch.no_grad():
+            if extractor == 'avg':
+                # Transfer to GPU where auxiliary network is stored
+                encodings = pose_features['penultimate']
+
+            else:
+                depth = len(self.conf.architecture['aux_net']['spatial_dim'])
+                encodings = torch.cat(
+                    [pose_features['feature_{}'.format(i)].reshape(
+                        self.batch_size, pose_features['feature_{}'.format(i)].shape[1], -1)
+                        for i in range(depth, 0, -1)],
+                    dim=2)
+
+        aux_out = self.aux_net(encodings)
+        return aux_out
 
 
 class Metric(object):
@@ -398,31 +500,25 @@ class Metric(object):
         self.dataset_obj.input_dataset(validate=True)
 
         self.network = network
-        self.model_save_path = conf.model_save_path
-        self.viz=conf.args['misc']['viz']                         # Controls visualization
+        self.viz=conf.viz                                                                       # Controls visualization
         self.conf = conf
-        self.epoch = conf.model_load_epoch
+        self.batch_size = conf.experiment_settings['batch_size']
+        self.ind_to_jnt = self.dataset_obj.ind_to_jnt
 
-        self.ind_to_jnt = {0: 'head', 1: 'neck', 2: 'lsho', 3: 'lelb', 4: 'lwri', 5: 'rsho', 6: 'relb', 7: 'rwri',
-                           8: 'lhip', 9: 'lknee', 10: 'lankl', 11: 'rhip', 12: 'rknee', 13: 'rankl'}
 
-        if conf.num_hm == 16:
-            self.ind_to_jnt[14] = 'pelvis'
-            self.ind_to_jnt[15] = 'thorax'
+        self.torch_dataloader = torch.utils.data.DataLoader(self.dataset_obj, batch_size=self.batch_size,
+                                                            shuffle=False, num_workers=2)
 
-        self.torch_dataloader = torch.utils.data.DataLoader(self.dataset_obj, conf.batch_size, shuffle=False,
-                                                            num_workers=8)
 
     def inference(self):
         '''
-        Returns model inferences
-        :return: (dict) images, heatmaps and other information to obtain U, V
+        Obtains model inference
+        :return: None
         '''
 
         self.network.eval()
         logging.info("Starting model inference")
 
-        image_ = None
         outputs_ = None
         scale_ = None
         num_gt_ = None
@@ -436,13 +532,10 @@ class Metric(object):
                     self.torch_dataloader):
 
                 assert split[0] == 1, "Validation split should be 1."
-
-                outputs, hourglass_features = self.network(images)
-
-                outputs = outputs[:, -1].detach()
+                outputs, pose_features = self.network(images)
+                outputs = outputs[:, -1]
 
                 try:
-                    image_ = torch.cat((image_, images.clone()), dim=0)
                     outputs_ = torch.cat((outputs_, outputs.cpu().clone()), dim=0)
                     scale_['scale_factor'] = torch.cat((scale_['scale_factor'], scale_params['scale_factor']), dim=0)
                     scale_['padding_u'] = torch.cat((scale_['padding_u'], scale_params['padding_u']), dim=0)
@@ -454,7 +547,6 @@ class Metric(object):
                     normalizer_ = torch.cat((normalizer_, normalizer), dim=0)
 
                 except TypeError:
-                    image_ = images.clone()
                     outputs_ = outputs.cpu().clone()
                     scale_ = copy.deepcopy(scale_params)
                     num_gt_ = num_gt
@@ -463,27 +555,35 @@ class Metric(object):
                     gt_ = gt
                     normalizer_ = normalizer
 
-                del images, outputs
+                # Generate visualizations (256x256) for that batch of images
+                if self.conf.viz:
+                    hm_uv_stack = []
+                    # Compute u,v values from heatmap
+                    for i in range(images.shape[0]):
+                        hm_uv = self.dataset_obj.estimate_uv(hm_array=outputs.cpu().numpy()[i],
+                                                             pred_placeholder=-np.ones_like(gt[i].numpy()))
+                        hm_uv_stack.append(hm_uv)
+                    hm_uv = np.stack(hm_uv_stack, axis=0)
+                    self.visualize_predictions(image=images.numpy(), name=name, dataset=dataset, gt=gt.numpy(), pred=hm_uv)
+
 
         scale_['scale_factor'] = scale_['scale_factor'].numpy()
         scale_['padding_u'] = scale_['padding_u'].numpy()
         scale_['padding_v'] = scale_['padding_v'].numpy()
 
-        model_inference = {'image': image_.numpy(), 'heatmap': outputs_.numpy(),
-                           'scale': scale_, 'num_gt': num_gt_, 'dataset': dataset_,
+        model_inference = {'heatmap': outputs_.numpy(), 'scale': scale_, 'dataset': dataset_,
                            'name': name_, 'gt': gt_.numpy(), 'normalizer': normalizer_.numpy()}
 
         return model_inference
 
+
     def keypoint(self, infer):
         '''
-        Scales the joints from heatmap to actual U, V on unscaled image
-        Returns ground truth and predictions CSV
-        :param infer: (dict) Dictionary returned by inference
-        :return: (pd.DataFrame, pd.DataFrame) GT and Pred CSV
+
+        :param infer:
+        :return:
         '''
 
-        image = infer['image']
         heatmap = infer['heatmap']
         scale = infer['scale']
         dataset = infer['dataset']
@@ -499,7 +599,7 @@ class Metric(object):
         pred_csv = []
 
         # Iterate over all heatmaps to obtain predictions
-        for i in range(image.shape[0]):
+        for i in range(gt.shape[0]):
 
             heatmap_ = heatmap[i]
 
@@ -549,10 +649,6 @@ class Metric(object):
                 gt_csv.append(gt_entry)
                 pred_csv.append(pred_entry)
 
-        # Visualize images on the 256, 256 images
-        if self.viz:
-            hm_uv = np.stack(hm_uv_stack, axis=0)
-            self.visualize_predictions(image=image, name=name, dataset=dataset, gt=gt, pred=hm_uv)
 
         pred_csv = pd.DataFrame(pred_csv, columns=csv_columns)
         gt_csv = pd.DataFrame(gt_csv, columns=csv_columns)
@@ -562,19 +658,19 @@ class Metric(object):
 
         assert len(pred_csv.index) == len(gt_csv.index), "Mismatch in number of entries in pred and gt dataframes."
 
-        pred_csv.to_csv(self.model_save_path.format("pred.csv"), index=False)
-        gt_csv.to_csv(self.model_save_path.format("gt.csv"), index=False)
+        pred_csv.to_csv(os.path.join(self.conf.model['save_path'], 'model_checkpoints/pred.csv'), index=False)
+        gt_csv.to_csv(os.path.join(self.conf.model['save_path'], 'model_checkpoints/gt.csv'), index=False)
         logging.info('Pandas dataframe saved successfully.')
 
         return gt_csv, pred_csv
 
+
     def visualize_predictions(self, image=None, name=None, dataset=None, gt=None, pred=None):
-        """
-        Helper function to visualize predictions
-        """
+
         dataset_viz = {}
         dataset_viz['img'] = image
         dataset_viz['name'] = name
+        dataset_viz['display_string'] = name
         dataset_viz['split'] = np.ones(image.shape[0])
         dataset_viz['dataset'] = dataset
         dataset_viz['bbox_coords'] = np.zeros([image.shape[0], 4, 4])
@@ -583,9 +679,7 @@ class Metric(object):
         dataset_viz['pred'] = pred
 
         dataset_viz = self.dataset_obj.recreate_images(gt=True, pred=True, external=True, ext_data=dataset_viz)
-        visualize_image(dataset_viz, bbox=False, uv=True)
-
-        return None
+        visualize_image(dataset_viz, save_dir=self.conf.model['save_path'], bbox=False)
 
 
     def compute_metrics(self, gt_df=None, pred_df=None):
@@ -609,8 +703,8 @@ class Metric(object):
             gt_ = gt_df.loc[gt_df['dataset'] == dataset_]
 
             # Compute scores
-            pck_df = PercentageCorrectKeypoint(pred_df=pred_, gt_df=gt_, config=self.conf,
-                                               jnts=list(self.ind_to_jnt.values()), data_name=dataset_)
+            pck_df = PercentageCorrectKeypoint(
+                pred_df=pred_, gt_df=gt_, config=self.conf, jnts=list(self.ind_to_jnt.values()))
 
             # Save the tables
             if dataset_ == 'mpii':
@@ -618,146 +712,143 @@ class Metric(object):
             else:
                 metric_ = 'PCK'
 
-            pck_df.to_csv(self.model_save_path.format("{}_{}.csv".format(metric_, dataset_)), index=False)
+            pck_df.to_csv(os.path.join(self.conf.model['save_path'],
+                                       'model_checkpoints/{}_{}.csv'.format(metric_, dataset_)),
+                          index=False)
 
         print("Metrics computation completed.")
 
+
     def eval(self):
         '''
-        Control flow to obtain predictions and corresponding metrics from Test()
+
+        :return:
         '''
         model_inference = self.inference()
         gt_csv, pred_csv = self.keypoint(model_inference)
         self.compute_metrics(gt_df=gt_csv, pred_df=pred_csv)
 
 
-def config():
-    conf = ParseConfig()
 
-    if conf.success:
-        logging.info('Successfully loaded config')
+def load_models(conf, load_pose, load_aux, model_dir):
+    """
+
+    :param conf:
+    :param load_pose:
+    :param load_aux:
+    :param model_dir:
+    :return:
+    """
+
+    # Initialize AuxNet, Hourglass/HRNet
+    # Elsewhere, resume training ensures the code creates a copy of the best models from the interrupted run.
+
+    if conf.use_auxnet:
+        logging.info('Initializing Auxiliary Network')
+        aux_net = AuxNet(arch=conf.architecture['aux_net'])
     else:
-        logging.warn('Could not load configuration! Exiting.')
-        exit()
+        aux_net = None
 
-    return conf
+    if conf.model['type'] == 'hourglass':
+        logging.info('Initializing Hourglass Network')
+        pose_net = Hourglass(arch=conf.architecture['hourglass'],
+                             auxnet=conf.use_auxnet,
+                             intermediate_features=conf.architecture['aux_net']['conv_or_avg_pooling'])
+        print('Number of parameters (Hourglass): {}\n'.format(count_parameters(pose_net)))
 
+    else:
+        logging.info('Initializing HRNet')
+        assert conf.model['type'] == 'hrnet', "Currently support 'hourglass' and 'hrnet'."
+        pose_net = HRNet(arch=conf.architecture['hrnet'],
+                         auxnet=conf.use_auxnet,
+                         intermediate_features=conf.architecture['aux_net']['conv_or_avg_pooling'])
+        print('Number of parameters (HRNet): {}\n'.format(count_parameters(pose_net)))
 
-def load_models(conf=None, load_hg=True, load_learnloss=True, best_model=None, hg_param=None, model_dir=None):
-    '''
-    Initialize or load model(s): Hourglass, Learning Loss network
+    # Load AuxNet modules (Best Model / resume training)
+    if load_aux:
+        if conf.resume_training:
+            logging.info('\n-------------- Resuming training (Loading AuxNet) --------------\n')
 
-    :param conf: (Object of type ParseConfig) Contains the configuration for the experiment
-    :param load_hg: (bool) Load Hourglass network
-    :param load_learnloss: (bool) Load learning Loss network
-    :param best_model: (bool) Load best model
-    :param hg_param: (recheck type) Parameters for the Hourglass network
-    :param model_dir: (string) Directory containing the model
-    :return: (torch.nn x 2) Hourglass network, Learning Loss network
-    '''
+            # Load and save the previous best model
+            aux_net.load_state_dict(torch.load(
+                os.path.join(model_dir, 'model_checkpoints/aux_net_{}.pth'.format(conf.active_learning['algorithm'])),
+                map_location='cpu'))
+            torch.save(
+                aux_net.state_dict(),
+                os.path.join(
+                    conf.model['save_path'],
+                    'model_checkpoints/aux_net_{}.pth'.format(conf.active_learning['algorithm'])))
 
-    epoch = conf.model_load_epoch
+            # Load the model corresponding to best pose model
+            aux_net.load_state_dict(
+                torch.load(
+                    os.path.join(
+                        model_dir, 'model_checkpoints/aux_net_{}_BestPose.pth'.format(conf.active_learning['algorithm'])),
+                    map_location='cpu'))
 
-    # Learn Loss model - Load or train from scratch, will be defined even if not needed
-    if load_learnloss:
-        logging.info('Loading Learning Loss model from: ' + model_dir)
-        learnloss_ = LearnLossActive(conf.learning_loss_fc, conf.args['hourglass']['inp_dim'], 4,
-                                     conf.learning_loss_original)
-
-        if best_model:
-            if conf.resume_training:
-                path_ = '_hg'  # *_hg will be the Learning Loss model at the epoch where HG gave best results
-            else:
-                path_ = ''  # best Learning Loss model
-            learnloss_.load_state_dict(torch.load(
-                model_dir
-                + 'model_checkpoints/best_model_learnloss_{}'.format(conf.learning_loss_obj)
-                + path_
-                + '.pth', map_location='cpu'))
         else:
-            learnloss_.load_state_dict(torch.load(model_dir + 'model_checkpoints/model_epoch_{}_learnloss.pth'.format(epoch), map_location='cpu'))
-    else:
-        logging.info('Defining the Learning Loss module. Training from scratch!')
-        learnloss_ = LearnLossActive(conf.learning_loss_fc, conf.args['hourglass']['inp_dim'], 4,
-                                     conf.learning_loss_original)
+            logging.info('Loading AuxNet Best Model')
+            aux_net.load_state_dict(
+                torch.load(os.path.join(
+                    model_dir, 'model_checkpoints/aux_net_{}.pth'.format(conf.active_learning['algorithm'])), map_location='cpu'))
 
-    # Hourglass MODEL - Load or train from scratch
-    if load_hg:
+    # Load Pose model (code is independent of architecture)
+    if load_pose:
+
         # Load model
-        logging.info('Loading Hourglass model from: ' + model_dir)
-        net_ = Hourglass(nstack=hg_param['nstack'], inp_dim=hg_param['inp_dim'], oup_dim=hg_param['oup_dim'],
-                         bn=hg_param['bn'], increase=hg_param['increase'])
+        logging.info('Loading Pose model from: ' + model_dir)
+        pose_net.load_state_dict(torch.load(os.path.join(model_dir, 'model_checkpoints/pose_net.pth'), map_location='cpu'))
+        logging.info("Successfully loaded Pose model.")
 
-        if best_model:
-            net_.load_state_dict(torch.load(os.path.join(model_dir, 'model_checkpoints/best_model.pth'), map_location='cpu'))
-        else:
-            net_.load_state_dict(torch.load(os.path.join(model_dir, 'model_checkpoints/model_epoch_{}.pth'.format(epoch)), map_location='cpu'))
+        if conf.resume_training:
+            logging.info('\n-------------- Resuming training (Loading PoseNet) --------------\n')
+            torch.save(pose_net.state_dict(), os.path.join(conf.model['save_path'], 'model_checkpoints/pose_net.pth'))
 
-        logging.info("Successfully loaded Model")
+    # CUDA support: Single/Multi-GPU
+    # Hourglass net and HRNet have CUDA definitions inside __init__(), specify only for aux_net
+    if conf.model['aux_net']['train'] or load_aux:
+        aux_net.cuda(torch.device('cuda:{}'.format(torch.cuda.device_count()-1)))
 
-    else:
-        # Define model and train from scratch
-        logging.info('Defining the network - Stacked Hourglass. Training from scratch!')
-        net_ = Hourglass(nstack=hg_param['nstack'], inp_dim=hg_param['inp_dim'], oup_dim=hg_param['oup_dim'],
-                         bn=hg_param['bn'], increase=hg_param['increase'])
+    logging.info('Successful: Model transferred to GPUs.\n')
 
-    # Multi-GPU / Single GPU
-    logging.info("Using " + str(torch.cuda.device_count()) + " GPUs")
-    net = net_
-    learnloss = learnloss_
-
-    if torch.cuda.device_count() > 1:
-        # Hourglass net has cuda definitions inside __init__(), specify for learnloss
-        learnloss.cuda(torch.device('cuda:1'))
-    else:
-        # Hourglass net has cuda definitions inside __init__(), specify for learnloss
-        learnloss.cuda(torch.device('cuda:0'))
-    logging.info('Successful: Model transferred to GPUs.')
-
-    return net, learnloss
+    return pose_net, aux_net
 
 
-def define_hyperparams(conf, net, learnloss):
-    '''
-    Defines the hyperparameters of the experiment
+def define_hyperparams(conf, pose_model, aux_net):#(conf, net, learnloss):
+    """
 
-    :param conf: (Object of type ParseConfig) Contains the configuration for the experiment
-    :param net: (torch.nn) HG model
-    :return: (dict) hyperparameter dictionary
-    '''
+    :param conf:
+    :param pose_model:
+    :param aux_net:
+    :return:
+    """
     logging.info('Initializing the hyperparameters for the experiment.')
     hyperparameters = dict()
     hyperparameters['optimizer_config'] = {
-                                           'lr': conf.lr,
-                                           'weight_decay': conf.weight_decay
+                                           'lr': conf.experiment_settings['lr'],
+                                           'weight_decay': conf.experiment_settings['weight_decay']
                                           }
     hyperparameters['loss_params'] = {'size_average': True}
-    hyperparameters['num_epochs'] = conf.epochs
+    hyperparameters['num_epochs'] = conf.experiment_settings['epochs']
     hyperparameters['start_epoch'] = 0  # Used for resume training
 
     # Parameters declared to the optimizer
-    if conf.train_learning_loss:
-        logging.info('Parameters of Learning Loss and Hourglass networks passed to Optimizer.')
-        params_list = [{'params': net.parameters()},
-                       {'params': learnloss.parameters()}]
+    if conf.model['aux_net']['train']:
+        logging.info('Parameters of AuxNet and PoseNet passed to Optimizer.')
+        params_list = [{'params': pose_model.parameters()},
+                       {'params': aux_net.parameters()}]
     else:
-        logging.info('Parameters of Hourglass passed to Optimizer')
-        params_list = [{'params': net.parameters()}]
+        logging.info('Parameters of PoseNet passed to Optimizer')
+        params_list = [{'params': pose_model.parameters()}]
 
     hyperparameters['optimizer'] = torch.optim.Adam(params_list, **hyperparameters['optimizer_config'])
 
     if conf.resume_training:
         logging.info('Loading optimizer state dictionary')
-        if conf.best_model:
-            optim_dict = torch.load(conf.model_load_path + 'model_checkpoints/optim_best_model.tar')
+        optim_dict = torch.load(os.path.join(conf.model['load_path'], 'model_checkpoints/optim_best_model.tar'))
 
-        else:
-            assert type(conf.model_load_epoch) == int, "Load epoch for optimizer not specified"
-            optim_dict = torch.load(conf.model_load_path + 'model_checkpoints/optim_epoch_{}.tar'.format(
-                conf.model_load_epoch))
-
-        # If the previous experiment used learn_loss, ensure the llal model is loaded, with the correct optimizer
-        assert optim_dict['learn_loss'] == conf.model_load_learnloss, "Learning Loss model needed to resume training"
+        # If the previous experiment trained aux_net, ensure the flag is true for the current experiment
+        assert optim_dict['aux_net'] == conf.model['aux_net']['train'], "AuxNet model needed to resume training"
 
         hyperparameters['optimizer'].load_state_dict(optim_dict['optimizer_load_state_dict'])
         logging.info('Optimizer state loaded successfully.\n')
@@ -770,82 +861,97 @@ def define_hyperparams(conf, net, learnloss):
                 logging.info('Key: {}\tValue: {}'.format(key, optim_dict[key]))
 
         logging.info('\n')
-
-        if conf.resume_training:
-            hyperparameters['start_epoch'] = optim_dict['epoch']
+        hyperparameters['start_epoch'] = optim_dict['epoch']
+        hyperparameters['mean_loss_validation'] = optim_dict['mean_loss_validation']
 
     hyperparameters['loss_fn'] = torch.nn.MSELoss(reduction='none')
 
     return hyperparameters
 
 
-def debug_viz(data_obj):
-    '''
-    Small code snippet to visualize heatmaps
-    :return:
-    '''
-    for i in range(30, 40):
-        _, hm, _, _, _, _, _, _, _ = data_obj.__getitem__(i)
-        fig, ax = plt.subplots(3, 5)
-        for j in range(hm.shape[0]):
-            ax[j // 5, j % 5].imshow(hm[j])
-            ax[j // 5, j % 5].set_title('Joint: {}'.format(j))
-        plt.show()
-
-
 def main():
-    '''
+    """
+    Control flow for the code
+    """
 
-    :return:
-    '''
+    # 1. Load configuration file --------------------------------------------------------------------------------------
+    logging.info('Loading configurations.\n')
+    conf  = ParseConfig()
 
-    # Load configuration file
-    conf  = config()
-    args = conf.args
 
-    # Loading MPII, LSPET
-    logging.info('Loading MPII, LSPET, LSP')
-    mpii_dict, max_persons_in_mpii = load_hp_dataset(mpii=True, conf=conf)
-    lspet_dict = load_hp_dataset(lspet=True, conf=conf)
-    lsp_dict = load_hp_dataset(lsp=True, conf=conf)
 
-    args['mpii_params']['max_persons'] = max_persons_in_mpii
 
-    # Defining the network
-    hg_param = args['hourglass']
-    network, learnloss = load_models(conf=conf, load_hg=conf.model_load_hg, load_learnloss=conf.model_load_learnloss,
-                                     best_model=conf.best_model, hg_param=hg_param, model_dir=conf.model_load_path)
+    # 2. Loading datasets ---------------------------------------------------------------------------------------------
+    logging.info('Loading pose dataset(s)\n')
+    dataset_dict = load_hp_dataset(dataset_conf=conf.dataset, model_conf=conf.model)
 
-    # Defining the Active Learning library
-    active_learning_obj = ActiveLearning(conf=conf, hg_network=network, learnloss_network=learnloss)
 
-    # Defining DataLoader
-    logging.info('Defining DataLoader.')
-    dataset_lspet_lsp_mpii = Dataset_MPII_LSPET_LSP(mpii_dict=mpii_dict, lspet_dict=lspet_dict, lsp_dict=lsp_dict,
-                                                    activelearning_obj=active_learning_obj, conf=conf,
-                                                    getitem_dump=conf.model_save_path, **args)
 
-    # Defining Hyperparameters
-    hyperparameters = define_hyperparams(conf, network, learnloss)
 
-    # Tensorboard
-    writer = SummaryWriter(log_dir=os.path.join(conf.model_save_path[:-20], 'tensorboard'))
+    # 3. Defining the network -----------------------------------------------------------------------------------------
+    logging.info('Initializing (and loading) human pose network and auxiliary network for Active Learning.\n')
+    pose_model, aux_net = load_models(conf=conf, load_pose=conf.model['load'], load_aux=conf.model['aux_net']['load'],
+                                      model_dir=conf.model['load_path'])
 
+
+
+
+    # 4. Defining the Active Learning library --------------------------------------------------------------------------
+    logging.info('Importing active learning object.\n')
+    if conf.activelearning_viz:
+        activelearning = ActiveLearning_Visualization(conf=conf, pose_net=pose_model, aux_net=aux_net)
+    else:
+        activelearning = ActiveLearning(conf=conf, pose_net=pose_model, aux_net=aux_net)
+
+
+
+
+    # 5. Defining DataLoader -------------------------------------------------------------------------------------------
+    logging.info('Defining DataLoader.\n')
+    datasets = HumanPoseDataLoader(dataset_dict=dataset_dict, activelearning=activelearning, conf=conf)
+
+
+    # 5.a: Delete models, activelearning object to remove stray computational graphs (esp. for EGL)
+    if conf.activelearning_viz:
+        exit()
+
+    del activelearning
+    del pose_model, aux_net
+    torch.cuda.empty_cache()
+    
+    logging.info('Re-Initializing (and loading) human pose network and auxiliary network.\n')
+    pose_model, aux_net = load_models(conf=conf, load_pose=conf.model['load'], load_aux=conf.model['aux_net']['load'],
+                                      model_dir=conf.model['load_path'])
+
+
+
+
+    # 6. Defining Hyperparameters, TensorBoard directory ---------------------------------------------------------------
+    logging.info('Initializing experiment settings.')
+    hyperparameters = define_hyperparams(conf=conf, pose_model=pose_model, aux_net=aux_net)
+
+    if conf.tensorboard:
+        writer = SummaryWriter(log_dir=os.path.join(conf.model['save_path'], 'tensorboard'))
+    else:
+        writer = None
+
+
+
+
+    # 7. Train the model
     if conf.train:
-        train_obj = Train(network=network, learnloss=learnloss, hyperparameters=hyperparameters,
-                          dataset_obj=dataset_lspet_lsp_mpii, conf=conf, tb_writer=writer)
+        train_obj = Train(pose_model=pose_model, aux_net=aux_net, hyperparameters=hyperparameters,
+                          dataset_obj=datasets, conf=conf, tb_writer=writer)
         train_obj.train_model()
 
+        del train_obj
         # Reload the best model for metric evaluation
-        network, learnloss = load_models(conf=conf, load_hg=True, load_learnloss=False, best_model=True,
-                                         hg_param=hg_param, model_dir=conf.model_save_path[:-20])
+        conf.resume_training = False
+        pose_model, _ = load_models(conf=conf, load_pose=True, load_aux=False, model_dir=conf.model['save_path'])
 
     if conf.metric:
-        metric_obj = Metric(network=network, dataset_obj=dataset_lspet_lsp_mpii, conf=conf)
+        metric_obj = Metric(network=pose_model, dataset_obj=datasets, conf=conf)
         metric_obj.eval()
-
-    #if args['misc']['viz']:
-    #    visualize_image(dataset_lspet_lsp_mpii.recreate_images(gt=True, train=True), bbox=True)
 
 
 if __name__ == "__main__":

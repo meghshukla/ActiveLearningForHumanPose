@@ -12,8 +12,8 @@ def single_person_distance(gt, pred, normalizer, conf):
     :return:
     '''
 
-    dist = -np.ones(1,)
     num_persons = 1
+    dist = -np.ones(num_persons,)
 
     for person in range(num_persons):
         # -1 indicates GT not present
@@ -21,15 +21,16 @@ def single_person_distance(gt, pred, normalizer, conf):
             dist[person] = -1.0
 
         # 0 indicates occluded
-        elif gt[person, 2] == 0 and (not conf.args['misc']['occlusion']):
+        elif gt[person, 2] == 0 and (not conf.experiment_settings['occlusion']):
             dist[person] = -1.0
 
-        elif (gt[person, 2] == 1 or (gt[person, 2] == 0 and conf.args['misc']['occlusion'])) and pred[person, 2] == -1:
+        elif (gt[person, 2] == 1 or (gt[person, 2] == 0 and conf.experiment_settings['occlusion'])) \
+              and pred[person, 2] == -1:
             dist[person] = np.inf
 
         else:
             # Visible joint, occluded with occlusion == True,
-            assert (gt[person, 2] == 1 or (gt[person, 2] == 0 and conf.args['misc']['occlusion']))\
+            assert (gt[person, 2] == 1 or (gt[person, 2] == 0 and conf.experiment_settings['occlusion']))\
                    and pred[person, 2] == 1,  "Check conditions again"
 
             dist[person] = np.linalg.norm(gt[person, :2].astype(np.float32) - pred[person, :2].astype(np.float32))
@@ -38,7 +39,7 @@ def single_person_distance(gt, pred, normalizer, conf):
     return dist
 
 
-def PercentageCorrectKeypoint(pred_df, gt_df, config, jnts, data_name):
+def PercentageCorrectKeypoint(pred_df, gt_df, config, jnts):
     """
     @params:
     - pred_df: prediction dataframe for the model outputs structured in the predefined manner

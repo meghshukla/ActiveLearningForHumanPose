@@ -2,102 +2,156 @@ import os
 import yaml
 import shutil
 import logging
+from pathlib import Path
 
 
 class ParseConfig(object):
-    '''
-    Stores the configurations as object
-    '''
-
+    """
+    Loads and returns the configuration specified in configuration.yml
+    """
     def __init__(self):
-        '''
-        Loads the configurations as specified in the file configuration.yml
-        '''
 
-        self.success = True
-        conf_yml = None
 
+        # 1. Load the configuration file ------------------------------------------------------------------------------
         try:
             f = open('configuration.yml', 'r')
-            conf_yml = yaml.load(f)
+            conf_yml = yaml.load(f, Loader=yaml.FullLoader)
             f.close()
         except FileNotFoundError:
-            logging.warn('Could not find configuration.yml')
-            self.success = False
+            logging.warning('Could not find configuration.yml')
+            exit()
 
-        if self.success:
 
-            self.experiment_name = conf_yml['experiment_name']
 
-            # Creates unique model save path to avoid overwriting
-            i_ = 1
-            self.model_save_path = os.path.join(conf_yml['model_save'], self.experiment_name + '_' + str(i_), 'model_checkpoints/{}')
-            while os.path.exists(self.model_save_path[:-3]):
-                i_ += 1
-                self.model_save_path = os.path.join(conf_yml['model_save'], self.experiment_name + '_' + str(i_), 'model_checkpoints/{}')
-            logging.info('\nSaving the model at: ' + self.model_save_path[:-3])
-            os.makedirs(self.model_save_path[:-3], exist_ok=True)
 
-            # TODO: Copy code directory instead of individual files
-            os.makedirs(os.path.join(self.model_save_path[:-20], 'code_files'), exist_ok=True)
-            for file in conf_yml['files_to_copy']:
-                try:
-                    shutil.copyfile(src=file, dst=os.path.join(self.model_save_path[:-20], 'code_files', file))
-                except FileNotFoundError:
-                    logging.warn('Could not copy files!')
-                    self.success = False
+        # 2. Initializing ParseConfig object --------------------------------------------------------------------------
+        self.model = conf_yml['model']
+        self.dataset = conf_yml['dataset']
+        self.active_learning = conf_yml['active_learning']
+        self.train = conf_yml['train']
+        self.metric = conf_yml['metric']
+        self.experiment_settings = conf_yml['experiment_settings']
+        self.architecture = conf_yml['architecture']
+        self.viz = conf_yml['visualize']
+        self.tensorboard = conf_yml['tensorboard']
+        self.resume_training = conf_yml['resume_training']
+        self.activelearning_viz = conf_yml['activelearning_visualization']
 
-            logging.info("File(s) successfully saved at: ")
-            logging.info(os.path.join(self.model_save_path[:-20], "code_files"))
 
-        if self.success:
 
-            self.train = conf_yml['train']
-            self.metric = conf_yml['metric']
-            self.model_load_hg = conf_yml['model_load_HG']
-            self.learnloss_only = conf_yml['learnloss_only']
-            self.model_load_learnloss = conf_yml['model_load_LearnLoss']
-            self.model_load_path = conf_yml['model_load_path']
-            self.resume_training = conf_yml['resume_training']
-            self.model_load_epoch = conf_yml['load_epoch']
-            self.best_model = conf_yml['best_model']
 
-            self.epochs = conf_yml['epochs']
-            self.lr = conf_yml['lr']
-            self.weight_decay = conf_yml['weight_decay']
-            self.batch_size = conf_yml['batch_size']
-            self.num_hm = conf_yml['num_heatmap']
-            self.hm_peak = conf_yml['args']['misc']['hm_peak']
-            self.threshold = conf_yml['args']['misc']['threshold']
-            self.n_stack = conf_yml['args']['hourglass']['nstack']
+        # 3. Extra initializations based on configuration chosen ------------------------------------------------------
 
-            self.train_learning_loss = conf_yml['args']['learning_loss_network']['train']
-            self.learning_loss_margin = conf_yml['args']['learning_loss_network']['margin']
-            self.learning_loss_warmup = conf_yml['args']['learning_loss_network']['warmup']
-            self.learning_loss_fc = conf_yml['args']['learning_loss_network']['fc']
-            self.learning_loss_original = conf_yml['args']['learning_loss_network']['original']
-            self.learning_loss_obj = conf_yml['args']['learning_loss_network']['training_obj']
+        # Whether to load AuxNet or not
+        if self.active_learning['algorithm'] in ['learning_loss', 'vl4pose', 'aleatoric']:
+            self.model['aux_net']['load'] = True
+            assert self.active_learning['algorithm'] == self.model['aux_net']['method'], \
+                "Same method should be chosen for active learning and aux net training."
+        else:
+            self.model['aux_net']['load'] = False
 
-            self.args = conf_yml['args']
-            self.mpii_newell_validation = conf_yml['args']['mpii_newell_validation']
-            self.active_learning_params = conf_yml['active_learning']
 
-            self.precached_mpii = conf_yml['precached_mpii']
-
-            # Assertion checks if the code is run in MPII_only mode.
-            if self.args['mpii_only']:
-                assert conf_yml['num_heatmap'] == 16, "MPII has 16 joints, but heatmaps defined are: {}".format(
-                    conf_yml['num_heatmap']
-                )
-
-                assert not self.args['mpii_params']['del_extra_jnts'], "del_extra_jnts is set to True"
-                assert self.args['hourglass']['oup_dim'] == 16, "MPII has 16 joints, but heatmaps defined are: {}".format(
-                    self.args['hourglass']['oup_dim']
-                )
-
+        # Number of convolutional channels for AuxNet
+        if self.model['type'] == 'hourglass':
+            if self.architecture['aux_net']['conv_or_avg_pooling'] == 'conv':
+                self.architecture['aux_net']['channels'] = [self.architecture['hourglass']['channels']] * 5
+                self.architecture['aux_net']['spatial_dim'] = [64, 32, 16, 8, 4]
             else:
-                assert conf_yml['num_heatmap'] == 14, "LSPET has 14 joints, but heatmaps defined are: {}".format(
-                    conf_yml['num_heatmap'])
+                self.architecture['aux_net']['channels'] = [self.architecture['hourglass']['channels']]
 
-                assert self.args['hourglass']['oup_dim'] == 14, "LSPET has 14 joints, but heatmaps defined are: " \
-                                                                "{}".format(self.args['hourglass']['oup_dim'])
+        else:
+            if self.architecture['aux_net']['conv_or_avg_pooling'] == 'conv':
+                self.architecture['aux_net']['channels'] = self.architecture['hrnet']['STAGE3']['NUM_CHANNELS']
+                self.architecture['aux_net']['spatial_dim'] = [
+                    64 // (2**i) for i in range(self.architecture['hrnet']['STAGE3']['NUM_BRANCHES'])]
+            else:
+                self.architecture['aux_net']['channels'] = [self.architecture['hrnet']['STAGE4']['NUM_CHANNELS'][0]]
+
+
+        # Number of heatmaps (or joints) based on the dataset
+        if self.dataset['load'] == 'mpii':
+            self.experiment_settings['num_hm'] = 16
+            self.architecture['hrnet']['num_hm'] = 16
+            self.architecture['hourglass']['num_hm'] = 16
+            self.architecture['aux_net']['num_hm'] = 16
+
+        else:
+            assert self.dataset['load'] == 'lsp' or self.dataset['load'] == 'merged',\
+                "num_hm defined only for 'mpii' and 'lsp' datasets"
+            self.experiment_settings['num_hm'] = 14
+            self.architecture['hrnet']['num_hm'] = 14
+            self.architecture['hourglass']['num_hm'] = 14
+            self.architecture['aux_net']['num_hm'] = 14
+
+
+
+        # Number of output nodes for the aux_network
+        if self.active_learning['algorithm'] == 'learning_loss':
+            assert self.model['aux_net']['method'] == 'learning_loss', "AuxNet train method should be same as algorithm"
+        if self.active_learning['algorithm'] == 'aleatoric':
+            assert self.model['aux_net']['method'] == 'aleatoric', "AuxNet train method should be same as algorithm"
+        if self.active_learning['algorithm'] == 'vl4pose':
+            assert self.model['aux_net']['method'] == 'vl4pose', "AuxNet train method should be same as algorithm"
+
+        if self.model['aux_net']['method'] == 'learning_loss':
+            self.architecture['aux_net']['fc'].append(1)
+        if self.model['aux_net']['method'] == 'aleatoric':
+            self.architecture['aux_net']['fc'].append(self.architecture['aux_net']['num_hm'])
+        if self.model['aux_net']['method'] == 'vl4pose':
+            if self.dataset['load'] == 'mpii':
+                self.architecture['aux_net']['fc'].append(15 * 2) # 15 links, hardcoded
+            else:
+                self.architecture['aux_net']['fc'].append(13 * 2)  # 13 links, hardcoded
+
+
+        # 1. Is aux_net inference required?  2. If train_auxnet_only, is auxnet set to train?
+        if self.active_learning['algorithm'] in ['learning_loss', 'vl4pose', 'aleatoric']:
+            assert self.model['aux_net']['train'], \
+                "Since AL algorithm: {}, set aux_net Train = True for next active learning cycle".format(self.active_learning['algorithm'])
+
+        self.use_auxnet = self.model['aux_net']['train'] 
+        
+        if self.model['aux_net']['train_auxnet_only']: assert self.model['aux_net']['train'], \
+            "Train aux_net only requires aux_net train = True"
+
+        
+
+
+        # Only HRNet, Hourglass supported
+        assert self.model['type'] in ['hrnet', 'hourglass'], "Invalid Model type given: {}.".format(self.model['type'])
+
+        # Resume training
+        if self.resume_training:
+            assert self.model['load'], "Resume training specified but model load == False"
+            assert self.train, "Resume training requires train to be True."
+
+
+
+        # if model load == False, then base method should be selected for sampling
+        if not self.model['load']:
+            assert self.active_learning['algorithm'] == 'base', "Sampler should be base since no model is loaded."
+
+        if self.experiment_settings['all_joints']:
+            assert self.experiment_settings['occlusion'], "Occlusion needs to be true if all joints is true."
+
+
+
+
+
+        # 4. Create directory for model save path ----------------------------------------------------------------------
+        self.experiment_name = conf_yml['experiment_name']
+        i = 1
+        model_save_path = os.path.join(self.model['save_path'], self.experiment_name + '_' + str(i))
+        while os.path.exists(model_save_path):
+            i += 1
+            model_save_path = os.path.join(self.model['save_path'], self.experiment_name + '_' + str(i))
+
+        logging.info('Saving the model at: ' + model_save_path)
+        os.makedirs(os.path.join(model_save_path, 'model_checkpoints'))
+
+        # Copy the configuration file into the model dump path
+        code_directory = Path(os.path.abspath(__file__)).parent
+        shutil.copytree(src=str(code_directory),
+                        dst=os.path.join(model_save_path, code_directory.parts[-1]))
+
+        self.model['save_path'] = model_save_path
