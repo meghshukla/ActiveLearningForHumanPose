@@ -17,7 +17,7 @@ This repository aims to collect and standardize results for various active learn
 ## Installation <a name="installation"></a>
 1. Create a new environment with `conda create --name AL4Pose python=3.8`
 2. Activate this environment: `conda activate AL4Pose`
-3. Install via conda: `conda install -c pytorch -c conda-forge -c anaconda pytorch opencv albumentations matplotlib numpy umap-learn scipy scikit- learn scikit-image tensorboard pandas torchaudio torchvision pyyaml seaborn jupyter`
+3. Install via conda: `conda install -c pytorch -c conda-forge -c anaconda pytorch opencv albumentations matplotlib numpy umap-learn scipy scikit-learn scikit-image tensorboard pandas torchaudio torchvision pyyaml seaborn jupyter`
 4. Install via pip: `pip install adjusttext`
 
 ## Organization <a name="organization"></a>
